@@ -1403,7 +1403,7 @@ int bch2_dev_shrink(struct bch_fs *c, struct bch_dev *ca, u64 new_nbuckets, stru
 
 		/* trigger reconcile range scan -> should kick off evacuation from range */
 		struct reconcile_scan s = {
-			.type = RECONCILE_SCAN_device, // TODO(performance): make this range-based
+			.type = RECONCILE_SCAN_shrink_range, // TODO(performance): make this range-based
 			.dev = ca->dev_idx,
 		};
 		ret = bch2_set_reconcile_needs_scan(c, s, true);

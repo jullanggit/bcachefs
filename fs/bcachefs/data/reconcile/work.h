@@ -12,6 +12,7 @@ extern const char * const bch2_reconcile_opts[];
 	x(metadata)			\
 	x(pending)			\
 	x(device)			\
+	x(shrink_range)			\
 	x(inum)
 
 struct reconcile_scan {
