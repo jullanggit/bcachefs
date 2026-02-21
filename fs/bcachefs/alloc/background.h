@@ -337,6 +337,7 @@ static inline const struct bch_backpointer *alloc_v4_backpointers_c(const struct
 	return (void *) ((u64 *) &a->v + BCH_ALLOC_V4_BACKPOINTERS_START(a));
 }
 
+int bch2_dev_truncate_alloc(struct bch_fs *c, struct bch_dev *ca, u64 cutoff);
 int bch2_dev_remove_alloc(struct bch_fs *, struct bch_dev *);
 
 void bch2_recalc_capacity(struct bch_fs *);
