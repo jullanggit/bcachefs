@@ -238,7 +238,7 @@ struct bkey {
  *
  * Specifically, when i was designing bkey, I wanted the header to be no
  * bigger than necessary so that bkey_packed could use the rest. That means that
- * decently offten extent keys will fit into only 8 bytes, instead of spilling over
+ * decently often extent keys will fit into only 8 bytes, instead of spilling over
  * to 16.
  *
  * But packed_bkey treats the part after the header - the packed section -
@@ -250,7 +250,7 @@ struct bkey {
  * So that constrains the key part of a bkig endian bkey to start right
  * after the header.
  *
- * If we ever do a bkey_v2 and need to expand the hedaer by another byte for
+ * If we ever do a bkey_v2 and need to expand the header by another byte for
  * some reason - that will clean up this wart.
  */
 __aligned(8)
@@ -542,6 +542,23 @@ struct bch_backpointer {
 	struct bpos		pos;
 } __packed __aligned(8);
 
+/*
+ * Denormalized cache of "is this bp's extent listed in reconcile_phys?":
+ *
+ * fsck needs to check that the reconcile_phys btrees agree with the extents
+ * btree, but a direct reconcile_phys <-> extents check would be expensive:
+ * for every reconcile_phys entry (keyed by bucket position), we'd have to do
+ * a random lookup against the extents btree. Instead, mirror the work_id into
+ * the backpointer so fsck can do two cheap pairwise checks:
+ *
+ *   - reconcile_phys <-> backpointers: both keyed by bucket position, indexed
+ *   - backpointers   <-> extents:	already required for backpointer fsck
+ *
+ * Invariant: when bp.flags PHYS != 0, reconcile_phys[PHYS] must have an entry
+ * at bp.k.p, and the extent must carry a bch_extent_reconcile entry whose
+ * rb_work_id_phys() equals PHYS. Every path that mutates reconcile_opts on an
+ * extent must keep the bp's PHYS flag in sync.
+ */
 BITMASK(BACKPOINTER_RECONCILE_PHYS,	struct bch_backpointer, flags, 0, 2);
 BITMASK(BACKPOINTER_ERASURE_CODED,	struct bch_backpointer, flags, 2, 3);
 BITMASK(BACKPOINTER_STRIPE_PTR,		struct bch_backpointer, flags, 3, 4);
@@ -1038,7 +1055,7 @@ LE64_BITMASK(BCH_SB_EXT_DISCARD_BUFFER,		struct bch_sb_field_ext, flags0, 38, 42
 	x(reconcile,			BCH_VERSION(1, 33),		\
 	  "Reconcile system for IO options inheritance "		\
 	  "and background data movement",			"2025-11")	\
-	x(extented_key_type_error,	BCH_VERSION(1, 34),		\
+	x(extended_key_type_error,	BCH_VERSION(1, 34),		\
 	  "KEY_TYPE_error changed to zero-byte value",		"2025-12")	\
 	x(bucket_stripe_index,		BCH_VERSION(1, 35),			\
 	  "Stripe index in alloc keys for efficient "				\
@@ -1131,7 +1148,7 @@ struct bch_sb {
 
 /*
  * Flags:
- * BCH_SB_INITALIZED	- set on first mount
+ * BCH_SB_INITIALIZED	- set on first mount
  * BCH_SB_CLEAN		- did we shut down cleanly? Just a hint, doesn't affect
  *			  behaviour of mount/recovery path:
  * BCH_SB_INODE_32BIT	- limit inode numbers to 32 bits
@@ -1228,6 +1245,7 @@ LE64_BITMASK(BCH_SB_REBALANCE_AC_ONLY,	struct bch_sb, flags[6], 23, 24);
 LE64_BITMASK(BCH_SB_WRITEBACK_TIMEOUT,	struct bch_sb, flags[6], 24, 40);
 LE64_BITMASK(BCH_SB_EXTENT_BP_SHIFT,	struct bch_sb, flags[6], 40, 48);
 LE64_BITMASK(BCH_SB_SCRUB_JOURNAL,	struct bch_sb, flags[6], 48, 50);
+LE64_BITMASK(BCH_SB_EC_MAX_DATA_BLOCKS,	struct bch_sb, flags[6], 50, 58);
 
 #define BCH_SB_EXTENT_BP_SHIFT_DEFAULT	10
 
@@ -1794,7 +1812,7 @@ static inline bool btree_id_can_reconstruct(enum btree_id btree)
 }
 
 /*
- * We can reconstruct BTREE_ID_alloc, but reconstucting it from scratch is not
+ * We can reconstruct BTREE_ID_alloc, but reconstructing it from scratch is not
  * so cheap and OOMs on huge filesystems (until we have online
  * check_allocations)
  */

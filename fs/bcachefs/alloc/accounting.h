@@ -117,7 +117,7 @@ do {									\
 int bch2_mod_dev_cached_sectors(struct btree_trans *, unsigned, s64, bool);
 
 int bch2_accounting_validate(struct bch_fs *, struct bkey_s_c,
-			     struct bkey_validate_context);
+			     const struct bkey_validate_context *);
 void bch2_accounting_key_to_text(struct printbuf *, struct bch_fs *, struct disk_accounting_pos *);
 void bch2_accounting_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 void bch2_accounting_swab(const struct bch_fs *, struct bkey_s);
@@ -315,6 +315,9 @@ int bch2_gc_accounting_start(struct bch_fs *);
 int bch2_gc_accounting_done(struct bch_fs *);
 
 int bch2_accounting_read(struct bch_fs *);
+
+
+int bch2_dev_truncate_accounting(struct bch_fs *, struct bch_dev *, u64, u64);
 
 int bch2_dev_usage_remove(struct bch_fs *, struct bch_dev *);
 int bch2_dev_usage_init(struct bch_dev *, bool);

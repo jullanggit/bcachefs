@@ -316,7 +316,9 @@ static int bch2_no_valid_pointers_repair(struct btree_trans *trans,
 
 		struct bch_inode_opts opts;
 		try(bch2_bkey_get_io_opts(trans, NULL, *k, &opts));
-		try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, new, SET_NEEDS_RECONCILE_opt_change, 0));
+		try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(new),
+						  BKEY_EXTENT_U64s_MAX,
+						  SET_NEEDS_RECONCILE_opt_change, 0));
 	} else {
 		ret_fsck_err(trans, extent_ptrs_all_invalid,
 			     "extent without valid pointers\n%s", buf.buf);
@@ -387,7 +389,9 @@ int bch2_check_fix_ptrs(struct btree_trans *trans,
 
 		struct bch_inode_opts opts;
 		try(bch2_bkey_get_io_opts(trans, NULL, k, &opts));
-		try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, new, SET_NEEDS_RECONCILE_opt_change, 0));
+		try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(new),
+						  BKEY_EXTENT_U64s_MAX,
+						  SET_NEEDS_RECONCILE_opt_change, 0));
 
 		if (!(flags & BTREE_TRIGGER_is_root)) {
 			CLASS(btree_node_iter, iter)(trans, btree, new->k.p, 0, level,
@@ -411,7 +415,7 @@ int bch2_check_fix_ptrs(struct btree_trans *trans,
 
 			/*
 			 * no locking, we're single threaded and not rw yet, see
-			 * the big assertino above that we repeat here:
+			 * the big assertion above that we repeat here:
 			 */
 			BUG_ON(test_bit(BCH_FS_rw, &c->flags));
 
@@ -878,36 +882,122 @@ static int __trigger_extent(struct btree_trans *trans,
 	return 0;
 }
 
-int bch2_trigger_extent(struct btree_trans *trans,
-			enum btree_id btree, unsigned level,
-			struct bkey_s_c old, struct bkey_s new,
-			enum btree_iter_update_trigger_flags flags)
+/* in-place update RECONCILE_PHYS if it is the only thing that changed */
+static int bch2_trigger_extent_reconcile_phys_update(struct btree_trans *trans,
+						 enum btree_id btree,
+						 unsigned level,
+						 struct bkey_s_c old,
+						 struct bkey_s new,
+						 bool *handled)
 {
-	struct bkey_ptrs_c new_ptrs = bch2_bkey_ptrs_c(new.s_c);
-	struct bkey_ptrs_c old_ptrs = bch2_bkey_ptrs_c(old);
+	struct bch_fs *c = trans->c;
+	struct bkey_i_backpointer old_bp[BCH_REPLICAS_MAX * 2];
+	struct bkey_i_backpointer new_bp[BCH_REPLICAS_MAX * 2];
+	struct bkey_ptrs_c ptrs;
+	const union bch_extent_entry *entry;
+	struct extent_ptr_decoded p;
+	unsigned nr_old = 0, nr_new = 0;
+	unsigned i;
+
+	*handled = false;
+	if (level)
+		return 0;
+
+	ptrs = bch2_bkey_ptrs_c(old);
+	bkey_for_each_ptr_decode(old.k, ptrs, p, entry) {
+		BUG_ON(nr_old == ARRAY_SIZE(old_bp));
+		bch2_extent_ptr_to_bp(c, btree, level, old, p, entry, &old_bp[nr_old++]);
+	}
+
+	ptrs = bch2_bkey_ptrs_c(new.s_c);
+	bkey_for_each_ptr_decode(new.k, ptrs, p, entry) {
+		BUG_ON(nr_new == ARRAY_SIZE(new_bp));
+		bch2_extent_ptr_to_bp(c, btree, level, new.s_c, p, entry, &new_bp[nr_new++]);
+	}
+
+	if (nr_old != nr_new)
+		return 0;
+
+	for (i = 0; i < nr_old; i++) {
+		struct bch_backpointer old_v = old_bp[i].v;
+		struct bch_backpointer new_v = new_bp[i].v;
+
+		SET_BACKPOINTER_RECONCILE_PHYS(&old_v, 0);
+		SET_BACKPOINTER_RECONCILE_PHYS(&new_v, 0);
+
+		if (!bpos_eq(old_bp[i].k.p, new_bp[i].k.p) ||
+		    memcmp(&old_v, &new_v, sizeof(old_v)))
+			return 0;
+	}
+
+	for (i = 0; i < nr_old; i++) {
+		unsigned old_phys = BACKPOINTER_RECONCILE_PHYS(&old_bp[i].v);
+		unsigned new_phys = BACKPOINTER_RECONCILE_PHYS(&new_bp[i].v);
+
+		if (!old_phys && !new_phys)
+			continue;
+
+		if (old_phys)
+			try(bch2_btree_bit_mod_buffered(trans,
+					reconcile_work_phys_btree[old_phys],
+					old_bp[i].k.p, false));
+
+		if (new_phys)
+			try(bch2_btree_bit_mod_buffered(trans,
+					reconcile_work_phys_btree[new_phys],
+					new_bp[i].k.p, true));
+
+		try(bch2_trans_update_buffered(trans,
+				backpointer_btree(&new_bp[i].v),
+				&new_bp[i].k_i));
+	}
+
+	*handled = true;
+	return 0;
+}
+
+int bch2_trigger_extent(struct btree_trans *trans, struct btree_trigger_op op)
+{
+	struct bkey_ptrs_c new_ptrs = bch2_bkey_ptrs_c(op.new.s_c);
+	struct bkey_ptrs_c old_ptrs = bch2_bkey_ptrs_c(op.old);
 	unsigned new_ptrs_bytes = (void *) new_ptrs.end - (void *) new_ptrs.start;
 	unsigned old_ptrs_bytes = (void *) old_ptrs.end - (void *) old_ptrs.start;
 
-	if (unlikely(flags & BTREE_TRIGGER_check_repair))
-		return bch2_check_fix_ptrs(trans, btree, level, new.s_c, flags);
+	if (unlikely(op.flags & BTREE_TRIGGER_check_repair))
+		return bch2_check_fix_ptrs(trans, op.btree, op.level, op.new.s_c, op.flags);
 
-	/* if pointers aren't changing - nothing to do: */
+	/* optimization for in-place updates to reconcile_phys to avoid delete-insert churn */
+	if (op.level == 0) {
+		bool handled;
+
+		try(bch2_trigger_extent_reconcile_phys_update(trans, op.btree, op.level, op.old, op.new, &handled));
+		if (handled)
+			return bch2_trigger_extent_reconcile(trans, op);
+	}
+
 	if (new_ptrs_bytes == old_ptrs_bytes &&
 	    !memcmp(new_ptrs.start,
 		    old_ptrs.start,
 		    new_ptrs_bytes))
 		return 0;
 
-	if (flags & (BTREE_TRIGGER_transactional|BTREE_TRIGGER_gc)) {
-		if (old.k->type)
-			try(__trigger_extent(trans, btree, level, old,
-					     flags & ~BTREE_TRIGGER_insert));
+	if (op.flags & (BTREE_TRIGGER_transactional|BTREE_TRIGGER_gc)) {
+		if ((op.flags & BTREE_TRIGGER_transactional) &&
+		    (op.flags & BTREE_TRIGGER_insert) &&
+		    !(op.flags & BTREE_TRIGGER_set_needs_reconcile_done) &&
+		    !op.level &&
+		    op.new.k->type)
+			try(bch2_extent_trigger_set_needs_reconcile(trans, &op));
 
-		if (new.k->type)
-			try(__trigger_extent(trans, btree, level, new.s_c,
-					     flags & ~BTREE_TRIGGER_overwrite));
+		if (op.old.k->type)
+			try(__trigger_extent(trans, op.btree, op.level, op.old,
+					     op.flags & ~BTREE_TRIGGER_insert));
 
-		try(bch2_trigger_extent_reconcile(trans, btree, level, old, new, flags));
+		if (op.new.k->type)
+			try(__trigger_extent(trans, op.btree, op.level, op.new.s_c,
+					     op.flags & ~BTREE_TRIGGER_overwrite));
+
+		try(bch2_trigger_extent_reconcile(trans, op));
 	}
 
 	return 0;
@@ -932,12 +1022,10 @@ static int __trigger_reservation(struct btree_trans *trans,
 	return 0;
 }
 
-int bch2_trigger_reservation(struct btree_trans *trans,
-			  enum btree_id btree_id, unsigned level,
-			  struct bkey_s_c old, struct bkey_s new,
-			  enum btree_iter_update_trigger_flags flags)
+int bch2_trigger_reservation(struct btree_trans *trans, struct btree_trigger_op op)
 {
-	return trigger_run_overwrite_then_insert(__trigger_reservation, trans, btree_id, level, old, new, flags);
+	return trigger_run_overwrite_then_insert(__trigger_reservation, trans,
+						 op.btree, op.level, op.old, op.new, op.flags);
 }
 
 /* Mark superblocks: */
@@ -1168,7 +1256,7 @@ static int disk_reservation_recalc_sectors_available(struct bch_fs *c,
 			struct disk_reservation *res,
 			u64 sectors, enum bch_reservation_flags flags)
 {
-	guard(mutex)(&c->capacity.sectors_available_lock);
+	guard(spinlock)(&c->capacity.sectors_available_lock);
 
 	percpu_u64_set(&c->capacity.pcpu->sectors_available, 0);
 	u64 sectors_available = avail_factor(__bch2_fs_usage_read_short(c).free);
@@ -1192,23 +1280,18 @@ static int disk_reservation_recalc_sectors_available(struct bch_fs *c,
 int __bch2_disk_reservation_add(struct bch_fs *c, struct disk_reservation *res,
 				u64 sectors, enum bch_reservation_flags flags)
 {
-	struct bch_fs_capacity_pcpu *pcpu;
-	u64 old, get;
-
-	guard(percpu_read)(&c->capacity.mark_lock);
-	preempt_disable();
-	pcpu = this_cpu_ptr(c->capacity.pcpu);
+	guard(preempt)();
+	struct bch_fs_capacity_pcpu *pcpu = this_cpu_ptr(c->capacity.pcpu);
 
 	if (unlikely(sectors > pcpu->sectors_available)) {
-		old = atomic64_read(&c->capacity.sectors_available);
+		u64 get, old = atomic64_read(&c->capacity.sectors_available);
+
 		do {
 			get = min((u64) sectors + SECTORS_CACHE, old);
 
-			if (unlikely(get < sectors)) {
-				preempt_enable();
+			if (unlikely(get < sectors))
 				return disk_reservation_recalc_sectors_available(c,
 								res, sectors, flags);
-			}
 		} while (!atomic64_try_cmpxchg(&c->capacity.sectors_available,
 					       &old, old - get));
 
@@ -1218,34 +1301,10 @@ int __bch2_disk_reservation_add(struct bch_fs *c, struct disk_reservation *res,
 	pcpu->sectors_available		-= sectors;
 	pcpu->online_reserved		+= sectors;
 	res->sectors			+= sectors;
-	preempt_enable();
 	return 0;
 }
 
 /* Startup/shutdown: */
-
-void bch2_buckets_nouse_free(struct bch_fs *c)
-{
-	for_each_member_device(c, ca) {
-		kvfree_rcu_mightsleep(ca->buckets_nouse);
-		ca->buckets_nouse = NULL;
-	}
-}
-
-int bch2_buckets_nouse_alloc(struct bch_fs *c)
-{
-	for_each_member_device(c, ca) {
-		BUG_ON(ca->buckets_nouse);
-
-		ca->buckets_nouse = bch2_kvmalloc(BITS_TO_LONGS(ca->mi.nbuckets) *
-					    sizeof(unsigned long),
-					    GFP_KERNEL|__GFP_ZERO);
-		if (!ca->buckets_nouse)
-			return bch_err_throw(c, ENOMEM_buckets_nouse);
-	}
-
-	return 0;
-}
 
 static void bucket_gens_free_rcu(struct rcu_head *rcu)
 {
@@ -1263,9 +1322,6 @@ int bch2_dev_buckets_resize(struct bch_fs *c, struct bch_dev *ca, u64 nbuckets)
 
 	if (resize)
 		lockdep_assert_held(&c->state_lock);
-
-	if (resize && ca->buckets_nouse)
-		return bch_err_throw(c, no_resize_with_buckets_nouse);
 
 	bucket_gens = bch2_kvmalloc(struct_size(bucket_gens, b, nbuckets),
 				    GFP_KERNEL|__GFP_ZERO);
@@ -1299,7 +1355,6 @@ int bch2_dev_buckets_resize(struct bch_fs *c, struct bch_dev *ca, u64 nbuckets)
 
 void bch2_dev_buckets_free(struct bch_dev *ca)
 {
-	kvfree(ca->buckets_nouse);
 	kvfree(rcu_dereference_protected(ca->bucket_gens, 1));
 	free_percpu(ca->usage);
 }

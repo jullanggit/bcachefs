@@ -9,7 +9,7 @@
 #define BCH_SB_MEMBERS_MAX		64
 
 /*
- * Sentinal value - indicates a device that does not exist
+ * Sentinel value - indicates a device that does not exist
  */
 #define BCH_SB_MEMBER_INVALID		255
 
@@ -76,6 +76,7 @@ struct bch_member {
 	__u8			device_model[64] __nonstring;
 	__le64			flush_errors;
 	__u8			device_serial[64] __nonstring;
+	__le64			target_nbuckets; /* 0 => idle, nbuckets => idle, < nbuckets => shrink target, > nbuckets => grow target */
 };
 
 /*

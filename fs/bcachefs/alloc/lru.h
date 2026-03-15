@@ -48,7 +48,7 @@ static inline enum bch_lru_type lru_type(struct bkey_s_c l)
 	}
 }
 
-int bch2_lru_validate(struct bch_fs *, struct bkey_s_c, struct bkey_validate_context);
+int bch2_lru_validate(struct bch_fs *, struct bkey_s_c, const struct bkey_validate_context *);
 void bch2_lru_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 
 void bch2_lru_pos_to_text(struct printbuf *, struct bpos);
@@ -70,7 +70,7 @@ static inline int bch2_lru_change(struct btree_trans *trans,
 		: 0;
 }
 
-int bch2_dev_remove_lrus(struct bch_fs *, struct bch_dev *);
+int bch2_dev_remove_lrus(struct bch_fs *, struct bch_dev *, u64);
 
 struct wb_maybe_flush;
 int bch2_lru_check_set(struct btree_trans *, u16, u64, u64, struct bkey_s_c,

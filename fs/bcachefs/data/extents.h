@@ -404,12 +404,12 @@ int bch2_bkey_pick_read_device(struct bch_fs *, struct bkey_s_c,
 /* KEY_TYPE_btree_ptr: */
 
 int bch2_btree_ptr_validate(struct bch_fs *, struct bkey_s_c,
-			    struct bkey_validate_context);
+			    const struct bkey_validate_context *);
 void bch2_btree_ptr_to_text(struct printbuf *, struct bch_fs *,
 			    struct bkey_s_c);
 
 int bch2_btree_ptr_v2_validate(struct bch_fs *, struct bkey_s_c,
-			       struct bkey_validate_context);
+			       const struct bkey_validate_context *);
 void bch2_btree_ptr_v2_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 void bch2_btree_ptr_v2_compat(enum btree_id, unsigned, unsigned,
 			      int, struct bkey_s);
@@ -445,7 +445,7 @@ bool bch2_extent_merge(struct bch_fs *, struct bkey_s, struct bkey_s_c);
 /* KEY_TYPE_reservation: */
 
 int bch2_reservation_validate(struct bch_fs *, struct bkey_s_c,
-			      struct bkey_validate_context);
+			      const struct bkey_validate_context *);
 void bch2_reservation_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 bool bch2_reservation_merge(struct bch_fs *, struct bkey_s, struct bkey_s_c);
 
@@ -613,7 +613,7 @@ bool bch2_bkey_devs_rw(struct bch_fs *, struct bkey_s_c);
 bool bch2_bkey_has_target(struct bch_fs *, struct bkey_s_c, unsigned);
 bool bch2_bkey_in_target(struct bch_fs *, struct bkey_s_c, unsigned);
 
-bool bch2_bkey_has_dev_bad_or_evacuating(struct bch_fs *, struct bkey_s_c);
+bool bch2_bkey_has_ptr_bad_or_evacuating(struct bch_fs *, struct bkey_s_c);
 
 void bch2_bkey_extent_entry_drop_s(const struct bch_fs *, struct bkey_s, union bch_extent_entry *);
 void bch2_bkey_extent_entry_drop(const struct bch_fs *, struct bkey_i *, union bch_extent_entry *);
@@ -711,7 +711,7 @@ void bch2_extent_ptr_to_text(struct printbuf *out, struct bch_fs *, const struct
 void bch2_bkey_ptrs_to_text(struct printbuf *, struct bch_fs *,
 			    struct bkey_s_c);
 int bch2_bkey_ptrs_validate(struct bch_fs *, struct bkey_s_c,
-			    struct bkey_validate_context);
+			    const struct bkey_validate_context *);
 
 static inline bool bch2_extent_ptr_eq(struct bch_extent_ptr ptr1,
 				      struct bch_extent_ptr ptr2)

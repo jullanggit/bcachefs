@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include "alloc/background.h"
+#include "alloc/format.h"
 #include "bcachefs.h"
+#include "bcachefs_format.h"
 #include "bcachefs_ioctl.h"
+#include "alloc/accounting_format.h"
 
 #include "alloc/accounting.h"
 #include "alloc/buckets.h"
 #include "alloc/replicas.h"
 
+#include "btree/bkey_types.h"
 #include "btree/cache.h"
+#include "btree/iter.h"
 #include "btree/journal_overlay.h"
+#include "btree/types.h"
 #include "btree/update.h"
 #include "btree/write_buffer.h"
 
@@ -182,7 +189,7 @@ static inline bool is_zero(char *start, char *end)
 #define field_end(p, member)	(((void *) (&p.member)) + sizeof(p.member))
 
 int bch2_accounting_validate(struct bch_fs *c, struct bkey_s_c k,
-			     struct bkey_validate_context from)
+			     const struct bkey_validate_context *from)
 {
 	struct disk_accounting_pos acc_k;
 	bpos_to_disk_accounting_pos(&acc_k, k.k->p);
@@ -192,7 +199,7 @@ int bch2_accounting_validate(struct bch_fs *c, struct bkey_s_c k,
 	if (acc_k.type >= BCH_DISK_ACCOUNTING_TYPE_NR)
 		return 0;
 
-	bkey_fsck_err_on((from.flags & BCH_VALIDATE_commit) &&
+	bkey_fsck_err_on((from->flags & BCH_VALIDATE_commit) &&
 			 bversion_zero(k.k->bversion),
 			 c, accounting_key_version_0,
 			 "accounting key with version=0");
@@ -530,7 +537,7 @@ void bch2_accounting_mem_gc(struct bch_fs *c)
  * Read out accounting keys for replicas entries, as an array of
  * bch_replicas_usage entries.
  *
- * Note: this may be deprecated/removed at smoe point in the future and replaced
+ * Note: this may be deprecated/removed at some point in the future and replaced
  * with something more general, it exists to support the ioctl used by the
  * 'bcachefs fs usage' command.
  */
@@ -959,39 +966,78 @@ static int accounting_read_mem_fixups(struct btree_trans *trans)
 	struct bch_fs *c = trans->c;
 	struct bch_accounting_mem *acc = &c->accounting;
 
-	darray_for_each_reverse(acc->k, i) {
+	/*
+	 * Filter zeroed/invalid entries with an in-place forward pass.
+	 *
+	 * We previously did this reverse-iterating + darray_remove_item per
+	 * dropped entry, which is O(N*R) memmove (each remove shifts the tail
+	 * back). On large arrays the replicas table grows combinatorially with
+	 * device count, and many entries come back zero on read, so the cost
+	 * was dominating mount time on big multi-device filesystems.
+	 *
+	 * Caller (bch2_accounting_read) has already sorted acc->k; forward
+	 * filter preserves that order.
+	 */
+	struct accounting_mem_entry *src = acc->k.data;
+	struct accounting_mem_entry *dst = acc->k.data;
+	struct accounting_mem_entry *end = acc->k.data + acc->k.nr;
+	int ret = 0;
+
+	while (src < end) {
 		struct disk_accounting_pos acc_k;
-		bpos_to_disk_accounting_pos(&acc_k, i->pos);
+		bpos_to_disk_accounting_pos(&acc_k, src->pos);
 
 		u64 v[BCH_ACCOUNTING_MAX_COUNTERS];
 		memset(v, 0, sizeof(v));
 
-		for (unsigned j = 0; j < i->nr_counters; j++)
-			v[j] = percpu_u64_get(i->v[0] + j);
+		for (unsigned j = 0; j < src->nr_counters; j++)
+			v[j] = percpu_u64_get(src->v[0] + j);
 
 		/*
 		 * If the entry counters are zeroed, it should be treated as
 		 * nonexistent - it might point to an invalid device.
 		 *
-		 * Remove it, so that if it's re-added it gets re-marked in the
+		 * Drop it, so that if it's re-added it gets re-marked in the
 		 * superblock:
 		 */
-		int ret = bch2_is_zero(v, sizeof(v[0]) * i->nr_counters)
+		ret = bch2_is_zero(v, sizeof(v[0]) * src->nr_counters)
 			? -BCH_ERR_remove_disk_accounting_entry
 			: lockrestart_do(trans,
-				bch2_disk_accounting_validate_late(trans, &acc_k, v, i->nr_counters));
+				bch2_disk_accounting_validate_late(trans, &acc_k, v, src->nr_counters));
 
 		if (ret == -BCH_ERR_remove_disk_accounting_entry) {
-			free_percpu(i->v[0]);
-			free_percpu(i->v[1]);
-			darray_remove_item(&acc->k, i);
+			free_percpu(src->v[0]);
+			free_percpu(src->v[1]);
+			src++;
 			ret = 0;
 			continue;
 		}
 
+		if (dst != src)
+			*dst = *src;
+		dst++;
+		src++;
+
 		if (ret)
-			return ret;
+			break;
 	}
+
+	/*
+	 * On error: shift unprocessed tail down so the array stays a
+	 * contiguous run of valid entries. Avoids leaking percpu storage on
+	 * any retry path that reads acc->k.nr.
+	 */
+	while (src < end) {
+		if (dst != src)
+			*dst = *src;
+		dst++;
+		src++;
+	}
+
+	acc->k.nr = dst - acc->k.data;
+
+	if (ret)
+		return ret;
 
 	eytzinger0_sort(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
 			accounting_pos_cmp, NULL);
@@ -1172,6 +1218,55 @@ int bch2_accounting_read(struct bch_fs *c)
 	 * across it - the commit path takes mark_lock itself.
 	 */
 	return accounting_read_mem_fixups(trans);
+}
+
+int bch2_dev_truncate_accounting(struct bch_fs *c, struct bch_dev *ca, u64 old_nbuckets, u64 cutoff) {
+	struct bpos start = POS(ca->dev_idx, cutoff);
+	struct bpos end = POS(ca->dev_idx, old_nbuckets);
+
+	CLASS(btree_trans, trans)(c);
+
+	/* accumulate deltas per data type, then apply them */
+	return commit_do(trans, NULL, NULL, 0, ({
+		s64 delta[BCH_DATA_NR][3] = {};
+		s64 keys = 0;
+		struct bkey_s_c k;
+		int ret = 0;
+
+		for_each_btree_key_max_norestart(trans, iter, BTREE_ID_alloc, start, end, BTREE_ITER_prefetch, k, ret) {
+			if (!k.k->type)
+				continue;
+
+			struct bch_alloc_v4 _alloc;
+			const struct bch_alloc_v4 *alloc = bch2_alloc_to_v4(k, &_alloc);
+
+			enum bch_data_type data_type = alloc->data_type;
+
+			delta[data_type][0] -= 1;
+			delta[data_type][1] -= bch2_bucket_sectors(*alloc);
+			delta[data_type][2] -= bch2_bucket_sectors_fragmented(ca, *alloc);
+
+			s64 unstriped = bch2_bucket_sectors_unstriped(*alloc);
+			if (unstriped) {
+				delta[BCH_DATA_unstriped][0] -= 1;
+				delta[BCH_DATA_unstriped][1] -= unstriped;
+			}
+
+			keys++;
+		}
+		if (!ret) {
+			delta[BCH_DATA_free][0] -= (old_nbuckets - cutoff) - keys;
+
+			for (unsigned type = 0; type < BCH_DATA_NR; type++) {
+				ret = bch2_disk_accounting_mod2(trans, false, delta[type], dev_data_type, .dev = ca->dev_idx, .data_type = type);
+
+				if (ret)
+					break;
+			}
+		}
+
+		ret;
+	}));
 }
 
 int bch2_dev_usage_remove(struct bch_fs *c, struct bch_dev *ca)

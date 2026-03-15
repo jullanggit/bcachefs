@@ -20,6 +20,7 @@
 #include "btree/init.h"
 #include "btree/interior.h"
 #include "btree/key_cache.h"
+#include "btree/locking.h"
 #include "btree/read.h"
 #include "btree/write.h"
 #include "btree/write_buffer.h"
@@ -320,9 +321,7 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 	u64 seq = 0;
 
 	bch2_maybe_schedule_btree_bitmap_gc_stop(c);
-	bch2_fs_ec_stop(c);
-	bch2_open_buckets_stop(c, NULL, true);
-	bch2_reconcile_stop(c);
+	bch2_open_buckets_stop(c, NULL, true, 0);
 	bch2_copygc_stop(c);
 	bch2_btree_write_buffer_stop(c);
 	bch2_fs_ec_flush(c);
@@ -336,8 +335,9 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 
 		bch2_do_discards_going_ro(c);
 
-		if (bch2_btree_interior_updates_flush(c) ||
-		    bch2_btree_write_buffer_flush_going_ro(c) ||
+		if (bch2_btree_write_buffer_flush_going_ro(c) ||
+		    bch2_btree_key_cache_flush_going_ro(c) ||
+		    bch2_btree_interior_updates_flush(c) ||
 		    bch2_journal_flush_all_pins(&c->journal) ||
 		    bch2_btree_flush_all_writes(c) ||
 		    seq != atomic64_read(&c->journal.seq)) {
@@ -345,6 +345,21 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 			clean_passes = 0;
 		}
 	} while (clean_passes < 2);
+
+	/*
+	 * On a dead journal the clean-shutdown loop above can't make dirty
+	 * btree nodes clean: journal_flush_all_pins doesn't push them out,
+	 * and __bch2_btree_node_write skips submission for journal_error, so
+	 * BTREE_NODE_dirty stays set on every node that hadn't been written
+	 * yet. The loop terminates (everything no-ops) but live[].dirty is
+	 * still populated. Force-cancel: drop dirty bits + transition DIRTY →
+	 * CLEAN, then drain any interior updates btree_node_write_update_key
+	 * may have kicked off before the journal died.
+	 */
+	if (bch2_journal_error(&c->journal)) {
+		bch2_btree_cancel_all_writes(c);
+		bch2_btree_interior_updates_flush(c);
+	}
 
 	bch_verbose(c, "flushing journal and stopping allocators complete, journal seq %llu",
 		    journal_cur_seq(&c->journal));
@@ -388,10 +403,49 @@ void bch2_fs_read_only(struct bch_fs *c)
 	bch_verbose(c, "going read-only");
 
 	/*
+	 * Close write points before stopping background data movers. Shrink can
+	 * leave copygc waiting on allocator space from its dedicated
+	 * write_point; dropping those open buckets first breaks that dependency
+	 * so kthread_stop() does not hang behind a move write that's blocked in
+	 * the allocator.
+	 */
+	bch2_open_buckets_stop(c, NULL, true, 0);
+
+	/*
+	 * Stop per-device resize workers while writes are still available.
+	 * A pending resize may be in the middle of transactional alloc/accounting
+	 * updates; if it survives into clean shutdown it can trip write-path
+	 * assertions while the filesystem is already going read-only.
+	 */
+	bch2_dev_resize_threads_stop(c);
+
+	/*
+	 * Stop background data movers before disabling writes globally:
+	 * reconcile/copygc move writes don't hold c->writes refs, but they do
+	 * still need journal/btree write access to finish their final index
+	 * updates. If we shut off writes first they'll trip -EROFS during
+	 * shutdown and spuriously account data_update failures.
+	 */
+	bch2_fs_ec_stop(c);
+	bch2_reconcile_stop(c);
+	bch2_copygc_stop(c);
+
+	/*
 	 * Block new foreground-end write operations from starting - any new
-	 * writes will return -EROFS:
+	 * writes will return -EROFS. Set before stopping reconcile so the
+	 * reconcile kthread's child workers (which check this flag to break
+	 * out) see it while bch2_reconcile_stop() is blocked waiting on them.
 	 */
 	set_bit(BCH_FS_going_ro, &c->flags);
+
+	/*
+	 * Stop background kthreads that issue writes (reconcile, etc.)
+	 * before disabling c->writes; otherwise they can dispatch
+	 * data_update operations that fail with erofs_no_writes once
+	 * c->writes is stopped, and the failure-rate threshold trips.
+	 */
+	bch2_reconcile_stop(c);
+
 	enumerated_ref_stop_async(&c->writes);
 
 	/*
@@ -433,10 +487,12 @@ void bch2_fs_read_only(struct bch_fs *c)
 	    c->recovery.pass_done >= BCH_RECOVERY_PASS_journal_replay) {
 		BUG_ON(c->journal.last_empty_seq != journal_cur_seq(&c->journal));
 		BUG_ON(!c->sb.clean);
-		BUG_ON(atomic_long_read(&c->btree.cache.nr_dirty));
+		BUG_ON(c->btree.cache.live[0].nr_dirty || c->btree.cache.live[1].nr_dirty);
 		BUG_ON(atomic_long_read(&c->btree.key_cache.nr_dirty));
-		BUG_ON(c->btree.write_buffer.inc.keys.nr);
-		BUG_ON(c->btree.write_buffer.flushing.keys.nr);
+		for (unsigned i = 0; i < BCH_WB_BTREE_NR; i++) {
+			BUG_ON(c->btree.write_buffer[i].inc.keys.nr);
+			BUG_ON(c->btree.write_buffer[i].flushing.keys.nr);
+		}
 		bch2_verify_replicas_refs_clean(c);
 		bch2_verify_accounting_clean(c);
 	} else {
@@ -473,6 +529,13 @@ static bool __bch2_fs_emergency_read_only(struct bch_fs *c, struct printbuf *out
 		bch2_journal_halt_locked(&c->journal);
 	bch2_fs_read_only_async(c);
 	wake_up(&bch2_read_only_wait);
+
+	/*
+	 * Wake threads parked in __bch2_wait_on_allocator: going-RO won't
+	 * complete while they hold open closures on freelist_wait, and they
+	 * won't otherwise notice the fs is shutting down.
+	 */
+	bch2_alloc_wake_all(c);
 
 	if (ret) {
 		prt_printf(out, "emergency read only at seq %llu\n",
@@ -637,6 +700,7 @@ static void __bch2_fs_free(struct bch_fs *c)
 	bch2_fs_errors_exit(c);
 	bch2_fs_encryption_exit(c);
 	bch2_fs_ec_exit(c);
+	bch2_fs_discards_exit(c);
 	bch2_fs_data_update_exit(c);
 	bch2_fs_move_exit(c);
 	bch2_fs_counters_exit(c);
@@ -1259,6 +1323,7 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	try(bch2_fs_compress_init(c));
 	try(bch2_fs_counters_init(c));
 	try(bch2_fs_data_update_init(c));
+	try(bch2_fs_discards_init(c));
 	try(bch2_fs_ec_init(c));
 	try(bch2_fs_errors_init(c));
 	try(bch2_fs_encryption_init(c));
@@ -1408,6 +1473,18 @@ static int __bch2_fs_start(struct bch_fs *c, struct printbuf *err)
 	try(bch2_fs_counters_init_late(c));
 
 	/*
+	 * Request no_sb_user_data_replicas eagerly at startup so it gets
+	 * persisted before any user-data accounting fires. Otherwise the
+	 * bump only happens lazily inside __bch2_accounting_maybe_kill (when
+	 * a user-data accounting entry zeroes), and a fresh fs that gets
+	 * forcibly shut down before that ever fires never persists the
+	 * version_incompat bump - on next mount, bch2_replicas_marked_locked
+	 * doesn't short-circuit for user data and accounting_read fsck_err's
+	 * for replicas not in the (no-longer-storing-them) sb.
+	 */
+	bch2_request_incompat_feature(c, bcachefs_metadata_version_no_sb_user_data_replicas);
+
+	/*
 	 * just make sure this is always allocated if we might need it - mount
 	 * failing due to kthread_create() failing is _very_ annoying
 	 */
@@ -1476,40 +1553,78 @@ static bool bch2_fs_will_resize_on_mount(struct bch_fs *c)
 
 int bch2_fs_resize_on_mount(struct bch_fs *c)
 {
-	for_each_online_member(c, ca, BCH_DEV_READ_REF_fs_resize_on_mount) {
-		if (bch2_dev_will_resize_on_mount(ca)) {
-			u64 old_nbuckets = ca->mi.nbuckets;
-			u64 new_nbuckets = div64_u64(get_capacity(ca->disk_sb.bdev->bd_disk),
-						     ca->mi.bucket_size);
+	scoped_guard(rwsem_write, &c->state_lock) {
+		for_each_online_member(c, ca, BCH_DEV_READ_REF_fs_resize_on_mount) {
+			if (bch2_dev_will_resize_on_mount(ca)) {
+				u64 old_nbuckets = ca->mi.nbuckets;
+				u64 new_nbuckets = div64_u64(get_capacity(ca->disk_sb.bdev->bd_disk),
+							     ca->mi.bucket_size);
 
-			bch_info_dev(ca, "resizing to size %llu", new_nbuckets * ca->mi.bucket_size);
-			int ret = bch2_dev_buckets_resize(c, ca, new_nbuckets);
-			bch_err_fn_dev(ca, ret);
-			if (ret) {
-				enumerated_ref_put(&ca->io_ref[READ],
-						   BCH_DEV_READ_REF_fs_resize_on_mount);
-				return ret;
-			}
-
-			scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-				guard(mutex)(&c->sb_lock);
-				struct bch_member *m =
-					bch2_members_v2_get_mut(c->disk_sb.sb, ca->dev_idx);
-				m->nbuckets = cpu_to_le64(new_nbuckets);
-				SET_BCH_MEMBER_RESIZE_ON_MOUNT(m, false);
-
-				c->disk_sb.sb->features[0] &= ~cpu_to_le64(BIT_ULL(BCH_FEATURE_small_image));
-				bch2_write_super(c);
-			}
-
-			if (ca->mi.freespace_initialized) {
-				ret = __bch2_dev_resize_alloc(ca, old_nbuckets, new_nbuckets);
+				bch_info_dev(ca, "resizing to size %llu", new_nbuckets * ca->mi.bucket_size);
+				int ret = bch2_dev_buckets_resize(c, ca, new_nbuckets);
+				bch_err_fn_dev(ca, ret);
 				if (ret) {
 					enumerated_ref_put(&ca->io_ref[READ],
-							BCH_DEV_READ_REF_fs_resize_on_mount);
+							   BCH_DEV_READ_REF_fs_resize_on_mount);
 					return ret;
 				}
+
+				scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
+					guard(mutex)(&c->sb_lock);
+					struct bch_member *m =
+						bch2_members_v2_get_mut(c->disk_sb.sb, ca->dev_idx);
+					m->nbuckets = cpu_to_le64(new_nbuckets);
+					SET_BCH_MEMBER_RESIZE_ON_MOUNT(m, false);
+
+					c->disk_sb.sb->features[0] &= ~cpu_to_le64(BIT_ULL(BCH_FEATURE_small_image));
+					bch2_write_super(c);
+				}
+
+				if (ca->mi.freespace_initialized) {
+					ret = __bch2_dev_resize_alloc(ca, old_nbuckets, new_nbuckets);
+					if (ret) {
+						enumerated_ref_put(&ca->io_ref[READ],
+								BCH_DEV_READ_REF_fs_resize_on_mount);
+						return ret;
+					}
+				}
 			}
+		}
+	}
+
+	/*
+	 * A pending shrink needs reconcile_scan and backpointer btree access.
+	 * The early resize-on-mount hook runs before btree roots are read so it
+	 * can handle grow-on-mount image expansion; defer shrink resume until a
+	 * later call once BCH_FS_btree_running is set.
+	 */
+	if (!test_bit(BCH_FS_btree_running, &c->flags))
+		return 0;
+
+	if (c->opts.read_only ||
+	    (c->sb.features & (BIT_ULL(BCH_FEATURE_small_image) |
+			       BIT_ULL(BCH_FEATURE_no_default_sb))))
+		return 0;
+
+	for_each_online_member(c, ca, BCH_DEV_READ_REF_fs_resize_on_mount) {
+		if (!bch2_dev_resize_pending(ca))
+			continue;
+
+		CLASS(printbuf, err)();
+		int ret;
+
+		bch_info_dev(ca, "resuming resize to size %llu",
+			     bch2_dev_resize_target(ca) * ca->mi.bucket_size);
+		ret = bch2_dev_resize_resume(c, ca, &err);
+		if (ret) {
+			if (err.pos)
+				bch_err_dev(ca, "%s", err.buf);
+			else
+				bch_err_fn_dev(ca, ret);
+
+			enumerated_ref_put(&ca->io_ref[READ],
+					   BCH_DEV_READ_REF_fs_resize_on_mount);
+			return ret;
 		}
 	}
 	return 0;
@@ -1639,6 +1754,7 @@ static void bcachefs_exit(void)
 	bch2_vfs_exit();
 	bch2_chardev_exit();
 	bch2_btree_key_cache_exit();
+	bch2_lock_graph_exit();
 	kobject_put(&bcachefs_kobj);
 }
 
@@ -1649,6 +1765,7 @@ static int __init bcachefs_init(void)
 	kobject_init(&bcachefs_kobj, &bcachefs_ktype);
 
 	if (kobject_add(&bcachefs_kobj, fs_kobj, "bcachefs") ||
+	    bch2_lock_graph_init() ||
 	    bch2_btree_key_cache_init() ||
 	    bch2_chardev_init() ||
 	    bch2_vfs_init() ||

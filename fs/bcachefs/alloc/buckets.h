@@ -302,12 +302,8 @@ int bch2_check_fix_ptrs(struct btree_trans *,
 			enum btree_id, unsigned, struct bkey_s_c,
 			enum btree_iter_update_trigger_flags);
 
-int bch2_trigger_extent(struct btree_trans *, enum btree_id, unsigned,
-			struct bkey_s_c, struct bkey_s,
-			enum btree_iter_update_trigger_flags);
-int bch2_trigger_reservation(struct btree_trans *, enum btree_id, unsigned,
-			  struct bkey_s_c, struct bkey_s,
-			  enum btree_iter_update_trigger_flags);
+int bch2_trigger_extent(struct btree_trans *, struct btree_trigger_op);
+int bch2_trigger_reservation(struct btree_trans *, struct btree_trigger_op);
 
 #define trigger_run_overwrite_then_insert(_fn, _trans, _btree_id, _level, _old, _new, _flags)\
 ({												\
@@ -419,14 +415,6 @@ DEFINE_CLASS(disk_reservation, struct disk_reservation_destructable,
 static inline u64 avail_factor(u64 r)
 {
 	return div_u64(r << RESERVE_FACTOR, (1 << RESERVE_FACTOR) + 1);
-}
-
-void bch2_buckets_nouse_free(struct bch_fs *);
-int bch2_buckets_nouse_alloc(struct bch_fs *);
-
-static inline bool bch2_bucket_nouse(struct bch_dev *ca, u64 bucket)
-{
-	return unlikely(ca->buckets_nouse && test_bit(bucket, ca->buckets_nouse));
 }
 
 int bch2_dev_buckets_resize(struct bch_fs *, struct bch_dev *, u64);
