@@ -469,9 +469,28 @@ int __bch2_dev_group_set(struct bch_fs *c, struct bch_dev *ca, const char *name)
 
 int bch2_dev_group_set(struct bch_fs *c, struct bch_dev *ca, const char *name)
 {
-	struct reconcile_scan s = { .type = RECONCILE_SCAN_pending };
+	/*
+	 * Changing a device label only changes target membership for extents that
+	 * currently point at that device. A device backpointer scan is enough to
+	 * rewrite reconcile state for both data extents and btree nodes that
+	 * reference this member; separate filesystem/metadata scans are broader
+	 * than necessary and can contend badly with shrink's own reconcile work.
+	 *
+	 * We still need a pending scan too: adding a device to a label can make
+	 * previously unsatisfied target work runnable even when the extent
+	 * doesn't currently point at this device.
+	 *
+	 * Queue the cookies before and after the superblock update so fsck/write
+	 * paths see a scan pending throughout the label transition, mirroring the
+	 * option-change hooks.
+	 */
+	struct reconcile_scan scans[] = {
+		{ .type = RECONCILE_SCAN_device, .dev = ca->dev_idx },
+		{ .type = RECONCILE_SCAN_pending },
+	};
 
-	try(bch2_set_reconcile_needs_scan(c, s, false));
+	for (unsigned i = 0; i < ARRAY_SIZE(scans); i++)
+		try(bch2_set_reconcile_needs_scan(c, scans[i], false));
 
 	/* bch2_reconcile_wakeup_pending goes here */
 	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
@@ -480,7 +499,8 @@ int bch2_dev_group_set(struct bch_fs *c, struct bch_dev *ca, const char *name)
 		try(bch2_write_super(c));
 	}
 
-	try(bch2_set_reconcile_needs_scan(c, s, true));
+	for (unsigned i = 0; i < ARRAY_SIZE(scans); i++)
+		try(bch2_set_reconcile_needs_scan(c, scans[i], true));
 	return 0;
 }
 
