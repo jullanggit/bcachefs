@@ -660,6 +660,7 @@ struct btree_trans {
 	bool			journal_replay_not_finished:1;
 	bool			notrace_relock_fail:1;
 	bool			has_interior_updates:1;
+	bool			no_trace_deadlock_write:1;
 	enum bch_errcode	restarted:16;
 	u32			restart_count;
 #ifdef CONFIG_BCACHEFS_INJECT_TRANSACTION_RESTARTS

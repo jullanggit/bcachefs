@@ -134,10 +134,16 @@ static noinline int trans_lock_write_fail(struct btree_trans *trans, struct btre
 		bch2_btree_node_unlock_write(trans, trans->paths + i->path, insert_l(trans, i)->b);
 	}
 
-	event_inc_trace(trans->c, trans_restart_would_deadlock_write, buf, ({
-		prt_printf(&buf, "%s\n", trans->fn);
-		bch2_btree_path_to_text(&buf, trans, i->path, trans->paths + i->path);
-	}));
+	if (!trans->no_trace_deadlock_write)
+		event_inc_trace(trans->c, trans_restart_would_deadlock_write, buf, ({
+			prt_printf(&buf, "%s\n", trans->fn);
+			bch2_btree_path_to_text(&buf, trans, i->path, trans->paths + i->path);
+		}));
+	else
+		event_trace(trans->c, trans_restart_would_deadlock_write, buf, ({
+			prt_printf(&buf, "%s\n", trans->fn);
+			bch2_btree_path_to_text(&buf, trans, i->path, trans->paths + i->path);
+		}));
 	return btree_trans_restart(trans, BCH_ERR_transaction_restart_would_deadlock_write);
 }
 

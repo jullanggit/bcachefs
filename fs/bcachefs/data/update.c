@@ -502,11 +502,14 @@ static int data_update_index_update_key(struct btree_trans *trans,
 }
 
 static int __bch2_data_update_index_update(struct btree_trans *trans,
-					   struct bch_write_op *op)
+						   struct bch_write_op *op)
 {
 	struct bch_fs *c = op->c;
 	struct data_update *u = container_of(op, struct data_update, op);
+	bool prev_no_trace_deadlock_write = trans->no_trace_deadlock_write;
 	int ret = 0;
+
+	trans->no_trace_deadlock_write = true;
 
 	CLASS(btree_iter, iter)(trans, u->btree_id,
 				bkey_start_pos(&bch2_keylist_front(&op->insert_keys)->k),
@@ -520,6 +523,7 @@ static int __bch2_data_update_index_update(struct btree_trans *trans,
 			prt_printf(&msg.m, "Got non-extent key to insert in data update path - confused:\n");
 			bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(insert));
 			msg.m.suppress = !bch2_count_fsck_err(c, data_update_got_non_extent, &msg.m);
+			trans->no_trace_deadlock_write = prev_no_trace_deadlock_write;
 			return 0;
 		}
 
@@ -536,6 +540,7 @@ static int __bch2_data_update_index_update(struct btree_trans *trans,
 			bch2_keylist_pop_front(&op->insert_keys);
 	}
 
+	trans->no_trace_deadlock_write = prev_no_trace_deadlock_write;
 	return ret;
 }
 
